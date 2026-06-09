@@ -1,0 +1,17 @@
+# Build artifacts
+DerivedData/
+DerivedData-*/
+build/
+*.log
+dist/
+
+# macOS
+.DS_Store
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+
+# Локальный бриф для дизайнера (не часть кода)
+landing-content.md

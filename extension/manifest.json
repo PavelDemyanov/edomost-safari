@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "ЭДО Мост для Safari",
+  "version": "1.0",
+  "description": "Мост для подписи документов в сервисах ЭДО (Моё Дело и др.) через Safari — проксирует вызовы страницы к локальному плагину на 127.0.0.1:18080. Неофициальное расширение.",
+  "icons": {
+    "48": "images/icon-48.png",
+    "96": "images/icon-96.png",
+    "128": "images/icon-128.png",
+    "256": "images/icon-256.png",
+    "512": "images/icon-512.png"
+  },
+  "permissions": [],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.moedelo.org/*",
+        "https://moedelo.org/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": [
+        "https://www.moedelo.org/*",
+        "https://moedelo.org/*"
+      ]
+    }
+  ]
+}
