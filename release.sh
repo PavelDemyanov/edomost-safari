@@ -51,6 +51,18 @@ xcodebuild -project "$XCPROJ" -scheme "MoeDeloBridge" -configuration Release \
 BUILT="$DD/Build/Products/Release/MoeDeloBridge.app"
 echo "✅ Собрано: $BUILT"
 
+# --- 2b. Пере-подпись с ЯВНЫМИ entitlements. Подписываем изнутри наружу:
+#   • расширение ОБЯЗАНО быть в песочнице (app-sandbox + network.client),
+#     иначе macOS молча отказывается его регистрировать;
+#   • приложение — БЕЗ песочницы: фоновому режиму плагина нужны launchctl,
+#     остановка чужих процессов и запись в ~/Library/LaunchAgents.
+ENT="$ROOT/sandbox.entitlements"
+echo "🔏 Пере-подпись (расширение: песочница; приложение: без)…"
+codesign --force --timestamp --options runtime --entitlements "$ENT" --sign "$SIGN_ID" "$BUILT/Contents/PlugIns/MoeDeloBridge Extension.appex"
+codesign --force --timestamp --options runtime --sign "$SIGN_ID" "$BUILT"
+echo "  entitlements расширения после пере-подписи:"
+codesign -d --entitlements - "$BUILT/Contents/PlugIns/MoeDeloBridge Extension.appex" 2>/dev/null | grep -iE "sandbox|network.client" | sed 's/^/    /'
+
 # --- 3. Проверка подписи (sandbox/hardened/без get-task-allow) -------------
 codesign --verify --deep --strict "$BUILT"
 APPEX="$BUILT/Contents/PlugIns/MoeDeloBridge Extension.appex"
