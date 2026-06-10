@@ -15,3 +15,13 @@ xcuserdata/
 
 # Локальный бриф для дизайнера (не часть кода)
 landing-content.md
+
+# Локальный тулинг мейнтейнера — не для публичного репозитория
+web-build/
+site/
+dist/
+DerivedData*/
+app-preview/
+design-handoff/
+app-design/
+.wrangler/

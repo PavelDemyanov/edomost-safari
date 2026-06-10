@@ -78,7 +78,7 @@ open xcode/MoeDeloBridge/MoeDeloBridge.xcodeproj
 
 ## Требования
 
-- macOS 12 (Monterey) или новее, браузер Safari
+- macOS 13 (Ventura) или новее, браузер Safari
 - Установленные **КриптоПро CSP** и **плагин «Моё Дело»** (тот же, что используется в Chrome)
 
 ## Установка для пользователей
