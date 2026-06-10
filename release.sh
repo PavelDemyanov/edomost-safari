@@ -16,7 +16,7 @@ set -euo pipefail
 
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
-ROOT="$HOME/Developer/MoeDeloSafariBridge"
+ROOT="$(cd "$(dirname "$0")" && pwd)"   # папка скрипта = корень проекта
 XCPROJ="$ROOT/xcode/MoeDeloBridge/MoeDeloBridge.xcodeproj"
 DD="$ROOT/DerivedData-release"
 OUT="$ROOT/dist"
