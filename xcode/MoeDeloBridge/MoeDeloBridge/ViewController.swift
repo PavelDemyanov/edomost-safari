@@ -212,7 +212,15 @@ class ViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHan
         default:
             if body.hasPrefix("resize:"), let h = Double(body.dropFirst(7)) {
                 DispatchQueue.main.async {
-                    self.view.window?.setContentSize(NSSize(width: 560, height: CGFloat(h)))
+                    guard let window = self.view.window else { return }
+                    var height = CGFloat(h)
+                    // Не выше видимой области экрана (меню + Док учтены в visibleFrame);
+                    // если экран совсем маленький — внутри окна появится прокрутка.
+                    if let screen = window.screen ?? NSScreen.main {
+                        let chrome = window.frame.height - window.contentLayoutRect.height
+                        height = min(height, screen.visibleFrame.height - chrome - 8)
+                    }
+                    window.setContentSize(NSSize(width: 560, height: height))
                 }
             }
         }

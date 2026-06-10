@@ -4,7 +4,10 @@ function send(msg) {
 
 function sendResize() {
     requestAnimationFrame(function () {
-        send("resize:" + (document.body.scrollHeight + 2));
+        // Высота именно контента: body.scrollHeight не бывает меньше окна,
+        // из-за чего окно умело только расти и не сжималось обратно.
+        var c = document.querySelector(".content");
+        send("resize:" + ((c ? c.offsetHeight : document.body.scrollHeight) + 2));
     });
 }
 
