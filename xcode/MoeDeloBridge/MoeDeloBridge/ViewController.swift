@@ -181,12 +181,21 @@ final class AppModel: ObservableObject {
     var allGood: Bool { extEnabled && pluginOk }
 
     /// Перепроверяет все три статуса; публикует результат на главной очереди.
-    func refresh() {
+    /// Перепроверяет статусы. `retries` > 0 — на старте: если служба ещё не отвечает
+    /// (автозапуск поднимает демон ~2 с), держим состояние «Проверка…» и пробуем снова,
+    /// чтобы пользователь не увидел ложное «не запущена».
+    func refresh(retries: Int = 0) {
         SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: extensionBundleIdentifier) { state, _ in
             let ext = state?.isEnabled ?? false
             self.checkPlugin { plugin in
                 let svc = PluginService.state
                 let old = PluginService.oldPluginInstalled
+                if !plugin && retries > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                        self.refresh(retries: retries - 1)
+                    }
+                    return
+                }
                 DispatchQueue.main.async {
                     self.extEnabled = ext
                     self.pluginOk = plugin
@@ -274,19 +283,21 @@ struct BridgeView: View {
     var body: some View {
         VStack(spacing: 16) {
             header
-            if model.oldPlugin { oldPluginCard }
+            if model.loaded && model.oldPlugin { oldPluginCard }
 
             GroupBox {
                 VStack(spacing: 0) {
                     statusRow(title: "Расширение Safari",
+                              loading: !model.loaded,
                               ok: model.extEnabled,
                               okText: "Включено", badText: "Выключено")
                     Divider().padding(.vertical, 8)
                     statusRow(title: "Служба подписи",
+                              loading: !model.loaded,
                               ok: model.pluginOk,
                               okText: "Запущена",
                               badText: model.service == "noplugin" ? "Не установлен" : "Не отвечает")
-                    if !model.extEnabled {
+                    if model.loaded && !model.extEnabled {
                         Divider().padding(.vertical, 8)
                         Button {
                             model.openSafariPreferences()
@@ -320,7 +331,7 @@ struct BridgeView: View {
                                 get: { model.service == "on" },
                                 set: { model.setBackgroundMode($0) }))
                             .toggleStyle(.switch)
-                            .disabled(model.busy || model.service == "noplugin")
+                            .disabled(model.busy || !model.loaded || model.service == "noplugin")
                             if model.busy {
                                 ProgressView().controlSize(.small).padding(.leading, 4)
                             }
@@ -422,15 +433,15 @@ struct BridgeView: View {
                 : "Включите фоновый режим ниже.")
     }
 
-    private func statusRow(title: String, ok: Bool, okText: String, badText: String) -> some View {
+    private func statusRow(title: String, loading: Bool = false, ok: Bool, okText: String, badText: String) -> some View {
         HStack {
             Text(title)
             Spacer()
             HStack(spacing: 6) {
                 Circle()
-                    .fill(ok ? Color.green : Color.orange)
+                    .fill(loading ? Color.gray : (ok ? Color.green : Color.orange))
                     .frame(width: 8, height: 8)
-                Text(ok ? okText : badText)
+                Text(loading ? "Проверка…" : (ok ? okText : badText))
                     .foregroundStyle(.secondary)
             }
         }
@@ -465,7 +476,7 @@ class ViewController: NSViewController {
                 DispatchQueue.main.async { self?.sizeWindowToFit() }
             }
 
-        model.refresh()
+        model.refresh(retries: 8)   // старт: ждём подъёма службы, не пугая ложным статусом
     }
 
     override func viewDidAppear() {
@@ -479,7 +490,7 @@ class ViewController: NSViewController {
     }
 
     @objc func appBecameActive() {
-        model.refresh()
+        model.refresh(retries: model.loaded ? 0 : 6)
     }
 
     private func sizeWindowToFit() {
