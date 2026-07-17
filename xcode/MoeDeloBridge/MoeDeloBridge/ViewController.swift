@@ -13,83 +13,72 @@ import SwiftUI
 let extensionBundleIdentifier = "ru.edomost.safari.Extension"
 let pluginCheckURL = "http://127.0.0.1:18080/TRUST/GetVer"
 
-// MARK: - Фоновый режим плагина (служба без значка в Доке)
+// MARK: - Служба подписи (нативный демон trustd)
 //
-// «Включить» — три обратимых шага, без прав администратора и без правки файлов вендора:
-//   1) теневой бандл в ~/Library/Application Support/…: копия Info.plist с
-//      LSUIElement=true (фоновое приложение без значка в Доке), а MacOS/Resources —
-//      симлинки на оригинал, так что бинарник, база и лог остаются вендорскими;
-//   2) вендорский LaunchAgent (/Library/LaunchAgents/StekTrustPlugin.plist)
-//      отключается per-user override'ом, чтобы при входе не поднималась
-//      вторая копия со значком (у плагина нет защиты от двух копий);
-//   3) наш агент ~/Library/LaunchAgents/ru.edomost.stektrust.plist запускает
-//      теневой путь при входе в систему и перезапускает плагин при сбое.
-// «Выключить» откатывает всё и запускает плагин как раньше (значок вернётся).
+// Заменяет вендорский StekTrustPlugin (x86_64, только через Rosetta) нашим
+// нативным arm64-демоном, встроенным в приложение (Contents/Helpers/trustd).
+// Демон поднимает HTTP на 127.0.0.1:18080 и транслирует запросы браузера
+// (/TRUST/*) в CryptoAPI КриптоПро. Единственное внешнее требование —
+// установленный КриптоПро CSP; вендорский плагин «Моё Дело» больше не нужен.
+// «Фоновый режим» — LaunchAgent, который держит демон запущенным (автозапуск
+// при входе, перезапуск при сбое). Всё обратимо и без прав администратора.
 
 enum PluginService {
-    static let pluginApp = "/Applications/StekTrustPlugin.app"
-    static let pluginBinary = pluginApp + "/Contents/MacOS/StekTrustPlugin"
-    static let vendorLabel = "StekTrustPlugin"
-    static let label = "ru.edomost.stektrust"
+    static let label = "ru.edomost.trustd"
+    static let vendorLabel = "StekTrustPlugin"        // вендорский агент — гасим, если остался
+    static let legacyLabel = "ru.edomost.stektrust"   // наш старый агент под StekTrust — мигрируем
+    static let vendorApp = "/Applications/StekTrustPlugin.app"  // старый x86-плагин вендора
 
     static var home: String { NSHomeDirectory() }
-    static var shadow: String { home + "/Library/Application Support/ЭДО Мост для Safari/StekTrustShadow" }
-    static var shadowBinary: String { shadow + "/Contents/MacOS/StekTrustPlugin" }
-    static var agentPlist: String { home + "/Library/LaunchAgents/\(label).plist" }
     static var gui: String { "gui/\(getuid())" }
+    static var daemonBinary: String { Bundle.main.bundlePath + "/Contents/Helpers/trustd" }
+    static var agentPlist: String { home + "/Library/LaunchAgents/\(label).plist" }
+    static var daemonLog: String { home + "/Library/Logs/edomost-trustd.log" }
 
-    static var pluginInstalled: Bool { FileManager.default.fileExists(atPath: pluginBinary) }
+    /// Единственная внешняя зависимость — КриптоПро CSP.
+    static var cspInstalled: Bool {
+        FileManager.default.fileExists(atPath: "/opt/cprocsp/lib/libcapi20.4.dylib")
+            || FileManager.default.fileExists(atPath: "/Library/Frameworks/CPROCSP.framework/CPROCSP")
+    }
+    /// Имя сохранено для существующих вызовов UI (теперь = «КриптоПро установлен»).
+    static var pluginInstalled: Bool { cspInstalled }
+
+    /// Старый вендорский плагин (x86, Rosetta) — если стоит, предлагаем удалить.
+    static var oldPluginInstalled: Bool { FileManager.default.fileExists(atPath: vendorApp) }
 
     static var enabled: Bool {
         FileManager.default.fileExists(atPath: agentPlist) && launchctl("print", "\(gui)/\(label)") == 0
     }
 
-    /// Состояние для UI: "on" / "off" / "noplugin".
+    /// Состояние для UI: "on" / "off" / "noplugin" (нет КриптоПро).
     static var state: String {
-        if !pluginInstalled { return "noplugin" }
+        if !cspInstalled { return "noplugin" }
         return enabled ? "on" : "off"
     }
 
     static func enable() throws {
         let fm = FileManager.default
-        guard pluginInstalled else {
-            throw err("Плагин подписи не найден в /Applications/StekTrustPlugin.app")
+        guard cspInstalled else { throw err("КриптоПро CSP не установлен") }
+        guard fm.fileExists(atPath: daemonBinary) else {
+            throw err("Демон подписи не найден в приложении")
         }
 
-        // 1. Теневой бандл: патченный Info.plist + симлинки на всё остальное.
-        try? fm.removeItem(atPath: shadow)
-        try fm.createDirectory(atPath: shadow + "/Contents", withIntermediateDirectories: true)
-        let infoData = try Data(contentsOf: URL(fileURLWithPath: pluginApp + "/Contents/Info.plist"))
-        guard var info = try PropertyListSerialization.propertyList(from: infoData, format: nil)
-                as? [String: Any] else {
-            throw err("Не удалось прочитать Info.plist плагина")
-        }
-        info["LSUIElement"] = true
-        let patched = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
-        try patched.write(to: URL(fileURLWithPath: shadow + "/Contents/Info.plist"))
-        for item in try fm.contentsOfDirectory(atPath: pluginApp + "/Contents") {
-            // Подписи у вендора нет; если появится — битую печать не наследуем.
-            if item == "Info.plist" || item == "_CodeSignature" { continue }
-            try fm.createSymbolicLink(atPath: shadow + "/Contents/" + item,
-                                      withDestinationPath: pluginApp + "/Contents/" + item)
-        }
+        // 1. Освободить порт 18080: сперва снять наш агент (иначе KeepAlive воскресит
+        //    демон под kill'ом), затем убрать старый StekTrust и любые копии демона.
+        launchctl("bootout", "\(gui)/\(label)")
+        migrateAwayFromStekTrust()
+        killDaemonProcesses()
 
-        // 2. Отключить вендорский автозапуск (он поднимал бы копию со значком).
-        launchctl("bootout", "\(gui)/\(vendorLabel)")
-        launchctl("disable", "\(gui)/\(vendorLabel)")
-
-        // 3. Остановить запущенные вручную копии — порт 18080 должен освободиться.
-        killPluginProcesses()
-
-        // 4. Наш агент: автозапуск при входе + перезапуск при сбое,
-        //    пока установлен сам плагин (PathState).
+        // 2. Наш агент: автозапуск при входе + перезапуск при сбое.
         let agent: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [shadowBinary],
+            "ProgramArguments": [daemonBinary, "18080"],
             "RunAtLoad": true,
-            "KeepAlive": ["PathState": [pluginBinary: true]],
+            "KeepAlive": true,
             "ProcessType": "Interactive",
             "AssociatedBundleIdentifiers": ["ru.edomost.safari"],
+            "StandardErrorPath": daemonLog,
+            "StandardOutPath": daemonLog,
         ]
         try fm.createDirectory(atPath: home + "/Library/LaunchAgents", withIntermediateDirectories: true)
         let agentData = try PropertyListSerialization.data(fromPropertyList: agent, format: .xml, options: 0)
@@ -105,22 +94,56 @@ enum PluginService {
     static func disable() {
         launchctl("bootout", "\(gui)/\(label)")
         try? FileManager.default.removeItem(atPath: agentPlist)
-        try? FileManager.default.removeItem(atPath: shadow)
-        killPluginProcesses()
-        launchctl("enable", "\(gui)/\(vendorLabel)")  // вернуть вендорский автозапуск
-        if pluginInstalled {                          // и запустить как раньше — со значком
-            run("/usr/bin/open", [pluginApp])         // блокирующий: переживает exit() CLI-пути
-        }
+        killDaemonProcesses()
     }
 
-    /// Убивает все копии плагина (вендорный и теневой пути) и ждёт их завершения.
-    static func killPluginProcesses() {
+    /// Миграция со старых версий: гасим наш прежний агент под StekTrust,
+    /// теневой бандл и вендорский автозапуск, чтобы освободить порт 18080.
+    static func migrateAwayFromStekTrust() {
+        launchctl("bootout", "\(gui)/\(legacyLabel)")
+        try? FileManager.default.removeItem(atPath: home + "/Library/LaunchAgents/\(legacyLabel).plist")
+        try? FileManager.default.removeItem(
+            atPath: home + "/Library/Application Support/ЭДО Мост для Safari/StekTrustShadow")
+        launchctl("bootout", "\(gui)/\(vendorLabel)")
+        launchctl("disable", "\(gui)/\(vendorLabel)")
+        run("/usr/bin/pkill", ["-f", "Contents/MacOS/StekTrustPlugin"])
+    }
+
+    /// Полностью убирает старый вендорский плагин: гасит автозапуск и процессы,
+    /// переносит .app в Корзину. Возвращает true, если его больше нет.
+    @discardableResult
+    static func removeOldPlugin() -> Bool {
+        launchctl("bootout", "\(gui)/\(vendorLabel)")
+        launchctl("disable", "\(gui)/\(vendorLabel)")
+        run("/usr/bin/pkill", ["-f", "Contents/MacOS/StekTrustPlugin"])
+        usleep(500_000)
+        guard FileManager.default.fileExists(atPath: vendorApp) else { return true }
+
+        // Если плагин ставился перетаскиванием — принадлежит пользователю, уходит в Корзину без прав.
+        if (try? FileManager.default.trashItem(at: URL(fileURLWithPath: vendorApp),
+                                               resultingItemURL: nil)) != nil, !oldPluginInstalled {
+            return true
+        }
+        // Инсталлятор «Моё Дело» ставит его от root — перенос между папками требует прав.
+        // Просим права администратора (штатный диалог macOS) и переносим в Корзину.
+        // Сначала убираем возможную прежнюю копию в Корзине (иначе mv в непустую папку падает).
+        let sh = "/bin/rm -rf '\(home)/.Trash/StekTrustPlugin.app'; /bin/mv -f '\(vendorApp)' '\(home)/.Trash/'"
+        let apple = "do shell script \"\(sh)\" with administrator privileges"
+        run("/usr/bin/osascript", ["-e", apple])
+        return !oldPluginInstalled
+    }
+
+    /// Останавливает наш демон и любые копии StekTrust; ждёт освобождения порта.
+    static func killDaemonProcesses() {
+        run("/usr/bin/pkill", ["-f", "Contents/Helpers/trustd"])
         run("/usr/bin/pkill", ["-f", "Contents/MacOS/StekTrustPlugin"])
         for _ in 0..<30 {  // до 3 секунд
-            if run("/usr/bin/pgrep", ["-qf", "Contents/MacOS/StekTrustPlugin"]) != 0 { return }
+            let a = run("/usr/bin/pgrep", ["-qf", "Contents/Helpers/trustd"])
+            let b = run("/usr/bin/pgrep", ["-qf", "Contents/MacOS/StekTrustPlugin"])
+            if a != 0 && b != 0 { return }
             usleep(100_000)
         }
-        run("/usr/bin/pkill", ["-9", "-f", "Contents/MacOS/StekTrustPlugin"])
+        run("/usr/bin/pkill", ["-9", "-f", "Contents/Helpers/trustd"])
         usleep(300_000)
     }
 
@@ -153,6 +176,7 @@ final class AppModel: ObservableObject {
     @Published var pluginOk = false      // локальный плагин отвечает по HTTP
     @Published var service = "off"       // фоновый режим: on / off / noplugin
     @Published var busy = false          // идёт включение/выключение службы
+    @Published var oldPlugin = false     // установлен старый x86-плагин StekTrust
 
     var allGood: Bool { extEnabled && pluginOk }
 
@@ -162,10 +186,12 @@ final class AppModel: ObservableObject {
             let ext = state?.isEnabled ?? false
             self.checkPlugin { plugin in
                 let svc = PluginService.state
+                let old = PluginService.oldPluginInstalled
                 DispatchQueue.main.async {
                     self.extEnabled = ext
                     self.pluginOk = plugin
                     self.service = svc
+                    self.oldPlugin = old
                     self.loaded = true
                 }
             }
@@ -182,6 +208,19 @@ final class AppModel: ObservableObject {
                 PluginService.disable()
             }
             Thread.sleep(forTimeInterval: 2.0)  // плагину нужно время поднять HTTP
+            DispatchQueue.main.async { self.busy = false }
+            self.refresh()
+        }
+    }
+
+    /// Удаляет старый вендорский плагин (в Корзину) и сразу включает нашу службу.
+    func removeOldPlugin() {
+        busy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            PluginService.removeOldPlugin()
+            do { try PluginService.enable() }
+            catch { NSLog("enable after removeOldPlugin: %@", error.localizedDescription) }
+            Thread.sleep(forTimeInterval: 2.0)
             DispatchQueue.main.async { self.busy = false }
             self.refresh()
         }
@@ -222,9 +261,7 @@ let pluginIcon: NSImage? = {
     if let d = Data(base64Encoded: pluginIconB64), let img = NSImage(data: d), img.isValid {
         return img
     }
-    // Запасной вариант: системная иконка установленного плагина.
-    return PluginService.pluginInstalled
-        ? NSWorkspace.shared.icon(forFile: PluginService.pluginApp) : nil
+    return nil
 }()
 
 // MARK: - Интерфейс (системный стиль)
@@ -235,6 +272,7 @@ struct BridgeView: View {
     var body: some View {
         VStack(spacing: 16) {
             header
+            if model.oldPlugin { oldPluginCard }
 
             GroupBox {
                 VStack(spacing: 0) {
@@ -276,7 +314,7 @@ struct BridgeView: View {
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Toggle("Запускать «МоеДело.Плагин» в фоне", isOn: Binding(
+                            Toggle("Запускать службу подписи в фоне", isOn: Binding(
                                 get: { model.service == "on" },
                                 set: { model.setBackgroundMode($0) }))
                             .toggleStyle(.switch)
@@ -286,8 +324,8 @@ struct BridgeView: View {
                             }
                         }
                         Text(model.service == "noplugin"
-                             ? "Сначала установите плагин «Моё Дело» — тот же, что используется в Chrome."
-                             : "Это плагин подписи — тот, что виден в Доке с этой иконкой. В фоновом режиме он запустится сам при входе в систему и будет работать без значка в Доке; при сбое macOS перезапустит его.")
+                             ? "Сначала установите КриптоПро CSP — тот же, что используется в Chrome."
+                             : "Встроенная служба подписи работает в фоне без окна: запустится сама при входе в систему, отдельный плагин «Моё Дело» не нужен; при сбое macOS перезапустит её.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -318,6 +356,33 @@ struct BridgeView: View {
     }
 
     // Шапка: крупный статус-символ + заголовок + подзаголовок.
+    private var oldPluginCard: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Найден старый плагин «Моё Дело»")
+                        .font(.headline)
+                    Text("У вас установлен прежний плагин подписи для процессоров Intel — он работает через Rosetta и в новых версиях macOS перестанет запускаться. Встроенная служба «ЭДО Мост» его полностью заменяет.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        model.removeOldPlugin()
+                    } label: {
+                        Label("Удалить старый плагин и перейти на новый", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .controlSize(.large)
+                    .disabled(model.busy)
+                }
+            }
+            .padding(6)
+        }
+    }
+
     private var header: some View {
         VStack(spacing: 6) {
             Image(systemName: headerInfo.symbol)

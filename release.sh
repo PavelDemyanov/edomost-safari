@@ -51,6 +51,10 @@ xcodebuild -project "$XCPROJ" -scheme "MoeDeloBridge" -configuration Release \
 BUILT="$DD/Build/Products/Release/MoeDeloBridge.app"
 echo "✅ Собрано: $BUILT"
 
+# --- 2a. Встроить нативный демон подписи trustd (helper внутри бандла) ------
+echo "🔧 Встраиваю trustd…"
+"$ROOT/daemon/embed_trustd.sh" "$BUILT" "$SIGN_ID"
+
 # --- 2b. Пере-подпись с ЯВНЫМИ entitlements. Подписываем изнутри наружу:
 #   • расширение ОБЯЗАНО быть в песочнице (app-sandbox + network.client),
 #     иначе macOS молча отказывается его регистрировать;

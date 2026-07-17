@@ -25,3 +25,10 @@ app-preview/
 design-handoff/
 app-design/
 .wrangler/
+
+# Реверс-инжиниринг протокола StekTrust (содержит перехваты/перс. данные) — НИКОГДА не публиковать
+reverse/
+
+# Локальный гид для Claude — не в публичный repo
+CLAUDE.md
+sandbox.entitlements
