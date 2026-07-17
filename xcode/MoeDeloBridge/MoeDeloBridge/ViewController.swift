@@ -200,6 +200,8 @@ final class AppModel: ObservableObject {
 
     func setBackgroundMode(_ on: Bool) {
         busy = true
+        // Запоминаем ручной выбор: если выключили — автозапуск при следующем старте не поднимет службу.
+        UserDefaults.standard.set(!on, forKey: "serviceUserDisabled")
         DispatchQueue.global(qos: .userInitiated).async {
             if on {
                 do { try PluginService.enable() }
@@ -280,9 +282,9 @@ struct BridgeView: View {
                               ok: model.extEnabled,
                               okText: "Включено", badText: "Выключено")
                     Divider().padding(.vertical, 8)
-                    statusRow(title: "Плагин подписи",
+                    statusRow(title: "Служба подписи",
                               ok: model.pluginOk,
-                              okText: "Запущен",
+                              okText: "Запущена",
                               badText: model.service == "noplugin" ? "Не установлен" : "Не отвечает")
                     if !model.extEnabled {
                         Divider().padding(.vertical, 8)
@@ -310,7 +312,7 @@ struct BridgeView: View {
                             .resizable()
                             .scaledToFit()
                             .frame(width: 44, height: 44)
-                            .accessibilityLabel("Иконка «МоеДело.Плагин»")
+                            .accessibilityLabel("Иконка службы подписи")
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
@@ -344,7 +346,7 @@ struct BridgeView: View {
             .controlSize(.large)
             .disabled(!model.allGood)
 
-            Text("Неофициальное приложение, не связано с сервисами ЭДО.\nНужны КриптоПро и плагин «Моё Дело» — те же, что для Chrome.")
+            Text("Неофициальное приложение, не связано с сервисами ЭДО.\nНужен КриптоПро — тот же, что для Chrome.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -404,7 +406,7 @@ struct BridgeView: View {
     private var headerInfo: (symbol: String, color: Color, title: String, subtitle: String) {
         if !model.loaded {
             return ("hourglass", .secondary, "Проверяю…",
-                    "Смотрю состояние расширения и плагина подписи.")
+                    "Смотрю состояние расширения и службы подписи.")
         }
         if model.allGood {
             return ("checkmark.seal.fill", .green, "Можно подписывать",
@@ -414,10 +416,10 @@ struct BridgeView: View {
             return ("puzzlepiece.extension", .orange, "Включите расширение",
                     "Подпись в Safari заработает после включения расширения в настройках.")
         }
-        return ("exclamationmark.triangle.fill", .orange, "Плагин подписи не отвечает",
+        return ("exclamationmark.triangle.fill", .orange, "Служба подписи не запущена",
                 model.service == "noplugin"
-                ? "Установите плагин «Моё Дело» (КриптоПро) — без него подпись не работает."
-                : "Запустите плагин «Моё Дело» или включите фоновый режим ниже.")
+                ? "Установите КриптоПро — без него подпись не работает."
+                : "Включите фоновый режим ниже.")
     }
 
     private func statusRow(title: String, ok: Bool, okText: String, badText: String) -> some View {

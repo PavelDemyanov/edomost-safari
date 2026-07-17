@@ -27,7 +27,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Override point for customization after application launch.
+        // Автозапуск встроенной службы подписи: при первом старте (и далее, пока
+        // пользователь сам её не выключил тумблером) поднимаем демон в фоне, чтобы
+        // подпись работала «из коробки». enable() идемпотентен — если служба уже
+        // запущена, ничего не делаем.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let userDisabled = UserDefaults.standard.bool(forKey: "serviceUserDisabled")
+            if PluginService.cspInstalled && !PluginService.enabled && !userDisabled {
+                try? PluginService.enable()
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
