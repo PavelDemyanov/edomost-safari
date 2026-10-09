@@ -32,3 +32,7 @@ reverse/
 # Локальный гид для Claude — не в публичный repo
 CLAUDE.md
 sandbox.entitlements
+
+# Материалы для claude.ai/design — локальный тулинг мейнтейнера
+claude-design/
+design-brief.md

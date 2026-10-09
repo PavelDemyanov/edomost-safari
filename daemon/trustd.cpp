@@ -5,8 +5,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <initializer_list>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -83,6 +86,16 @@ static std::string filetimeDate(const FILETIME& ft){
     unsigned long long t=((unsigned long long)ft.dwHighDateTime<<32)|ft.dwLowDateTime;
     time_t secs=(time_t)((t-116444736000000000ULL)/10000000ULL);
     struct tm g; gmtime_r(&secs,&g); char b[16]; strftime(b,16,"%Y-%m-%d",&g); return b;
+}
+// hex-строка (регистр любой) → байты; false, если не hex или нечётная длина
+static bool hexStr2bin(const std::string& h, std::vector<BYTE>& out){
+    if(h.empty() || h.size()%2) return false;
+    out.clear();
+    for(size_t i=0;i<h.size();i+=2){
+        unsigned v; if(!isxdigit((unsigned char)h[i])||!isxdigit((unsigned char)h[i+1])) return false;
+        sscanf(h.c_str()+i,"%2x",&v); out.push_back((BYTE)v);
+    }
+    return true;
 }
 static LPCSTR hashOid(HCRYPTPROV hProv, DWORD keySpec){
     HCRYPTKEY hKey; ALG_ID alg; DWORD cb=sizeof(alg);
@@ -187,6 +200,138 @@ static bool signDetached(const std::string& thumb, const std::vector<BYTE>& doc,
     return ok;
 }
 
+//--------- DER: ровно столько, сколько нужно для SignedData ---------
+typedef std::vector<BYTE> Bytes;
+static Bytes tlv(BYTE tag, const Bytes& v){
+    Bytes o(1,tag); size_t n=v.size();
+    if(n<0x80) o.push_back((BYTE)n);
+    else { BYTE b[8]; int k=0; while(n){ b[k++]=(BYTE)(n&0xFF); n>>=8; } o.push_back((BYTE)(0x80|k)); while(k) o.push_back(b[--k]); }
+    o.insert(o.end(),v.begin(),v.end()); return o;
+}
+static Bytes cat(std::initializer_list<Bytes> parts){
+    Bytes o; for(const Bytes& p: parts) o.insert(o.end(),p.begin(),p.end()); return o;
+}
+static Bytes seq(std::initializer_list<Bytes> parts){ return tlv(0x30,cat(parts)); }
+static Bytes setOf(std::initializer_list<Bytes> parts){ return tlv(0x31,cat(parts)); }
+static Bytes oid(const char* dotted){
+    std::vector<unsigned long> a; const char* p=dotted;
+    while(*p){ a.push_back(strtoul(p,(char**)&p,10)); if(*p=='.')p++; }
+    Bytes v; if(a.size()<2) return tlv(0x06,v);
+    a[1]+=a[0]*40; a.erase(a.begin());
+    for(unsigned long x: a){ BYTE b[10]; int k=0; do{ b[k++]=(BYTE)(x&0x7F); x>>=7; }while(x);
+        while(k>1) v.push_back((BYTE)(0x80|b[--k])); v.push_back(b[0]); }
+    return tlv(0x06,v);
+}
+static Bytes raw(const BYTE* p, size_t n){ return Bytes(p,p+n); }
+// INTEGER из серийника CryptoAPI (little-endian) → big-endian, с ведущим 0x00 при старшем бите
+static Bytes serialInt(const CRYPT_INTEGER_BLOB& sn){
+    Bytes v(sn.pbData,sn.pbData+sn.cbData); std::reverse(v.begin(),v.end());
+    if(v.empty()||(v[0]&0x80)) v.insert(v.begin(),0);
+    return tlv(0x02,v);
+}
+static ALG_ID hashAlgId(LPCSTR oidStr){
+    if(!strcmp(oidStr,szOID_CP_GOST_R3411_12_256)) return CALG_GR3411_2012_256;
+    if(!strcmp(oidStr,szOID_CP_GOST_R3411_12_512)) return CALG_GR3411_2012_512;
+    return CALG_GR3411;
+}
+static bool cspHash(HCRYPTPROV hProv, ALG_ID alg, const Bytes& d, Bytes& out){
+    HCRYPTHASH h; if(!CryptCreateHash(hProv,alg,0,0,&h)) return false;
+    DWORD n=0; bool ok=CryptHashData(h,d.empty()?NULL:&d[0],(DWORD)d.size(),0)
+        && CryptGetHashParam(h,HP_HASHVAL,NULL,&n,0);
+    if(ok){ out.resize(n); ok=CryptGetHashParam(h,HP_HASHVAL,&out[0],&n,0); }
+    CryptDestroyHash(h); return ok;
+}
+// Отсоединённая CAdES-BES подпись по готовому хэшу документа (SIGN_HASH_SYNC) → base64.
+// Та же структура, что CryptMsg собирает для GETSIGN_SYNC, но messageDigest = переданный хэш:
+// CryptMsg хэширует контент сам, поэтому SignedData собираем вручную и подписываем CryptSignHash.
+static bool signHash(const std::string& thumb, const std::string& body, std::string& outB64, std::string& err, std::string& info){
+    HCERTSTORE hStore=CertOpenSystemStore(0,_TEXT("My")); if(!hStore){err="store";return false;}
+    PCCERT_CONTEXT cert=findByThumb(hStore,thumb);
+    if(!cert){ err="cert not found"; CertCloseStore(hStore,0); return false; }
+    HCRYPTPROV hProv; DWORD keySpec; BOOL freeProv;
+    if(!CryptAcquireCertificatePrivateKey(cert,0,NULL,&hProv,&keySpec,&freeProv)){
+        err="acquire private key";
+        CertFreeCertificateContext(cert); CertCloseStore(hStore,0); return false;
+    }
+    bool ok=false;
+    LPCSTR hOid=hashOid(hProv,keySpec);
+    do{
+        if(!hOid){ err="hash oid"; break; }
+        ALG_ID alg=hashAlgId(hOid);
+        size_t need = alg==CALG_GR3411_2012_512 ? 64 : 32;
+        // хэш приходит base64 (как документ в GETSIGN_SYNC); на всякий случай принимаем и hex
+        Bytes digest; std::string t=body;
+        while(!t.empty() && isspace((unsigned char)t[t.size()-1])) t.erase(t.size()-1);
+        if(!(t.size()==need*2 && hexStr2bin(t,digest))){
+            digest=b64dec(t);
+            Bytes h; if(digest.size()==need*2 && hexStr2bin(std::string(digest.begin(),digest.end()),h)) digest=h;
+        }
+        char ib[48]; snprintf(ib,sizeof(ib),"hashLen=%zu",digest.size()); info=ib;
+        if(digest.size()!=need){ err="Неверная длина хэша"; break; }
+
+        Bytes certDer=raw(cert->pbCertEncoded,cert->cbCertEncoded), certHash;
+        if(!cspHash(hProv,alg,certDer,certHash)){ err="cert hash"; break; }
+        Bytes issuer=raw(cert->pCertInfo->Issuer.pbData,cert->pCertInfo->Issuer.cbData);
+        Bytes serial=serialInt(cert->pCertInfo->SerialNumber);
+        Bytes hashAlg=seq({oid(hOid)});
+
+        char ut[16]; time_t now=time(NULL); struct tm g; gmtime_r(&now,&g); strftime(ut,sizeof(ut),"%y%m%d%H%M%SZ",&g);
+        // порядок атрибутов — как у CryptoPro в GETSIGN_SYNC
+        Bytes attrs=cat({
+            seq({oid(szOID_RSA_contentType),   setOf({oid(szOID_RSA_data)})}),
+            seq({oid(szOID_RSA_signingTime),   setOf({tlv(0x17,Bytes(ut,ut+13))})}),
+            seq({oid(szOID_RSA_messageDigest), setOf({tlv(0x04,digest)})}),
+            seq({oid("1.2.840.113549.1.9.16.2.47"), setOf({ seq({ seq({ seq({   // signingCertificateV2
+                hashAlg, tlv(0x04,certHash),
+                seq({ seq({tlv(0xA4,issuer)}), serial })                      // IssuerSerial
+            }) }) }) })})
+        });
+        // подписываются атрибуты в DER-виде SET OF (тег 0x31), в сообщение кладутся как [0] IMPLICIT
+        Bytes toSign=tlv(0x31,attrs);
+        HCRYPTHASH h; if(!CryptCreateHash(hProv,alg,0,0,&h)){ err="hash"; break; }
+        DWORD sl=0; bool sok=CryptHashData(h,&toSign[0],(DWORD)toSign.size(),0)
+            && CryptSignHash(h,keySpec,NULL,0,NULL,&sl);
+        Bytes sig(sl);
+        if(sok) sok=CryptSignHash(h,keySpec,NULL,0,sl?&sig[0]:NULL,&sl);
+        CryptDestroyHash(h);
+        if(!sok){ err="sign failed"; break; }
+        sig.resize(sl); std::reverse(sig.begin(),sig.end());   // CryptoAPI отдаёт little-endian, в CMS — наоборот
+
+        Bytes signerInfo=seq({ tlv(0x02,Bytes(1,1)), seq({issuer,serial}), hashAlg,
+            tlv(0xA0,attrs), seq({oid(cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId)}), tlv(0x04,sig) });
+        Bytes signedData=seq({ tlv(0x02,Bytes(1,1)), setOf({hashAlg}), seq({oid(szOID_RSA_data)}),
+            tlv(0xA0,certDer), setOf({signerInfo}) });
+        Bytes ci=seq({ oid(szOID_RSA_signedData), tlv(0xA0,signedData) });
+        outB64=b64enc(&ci[0],ci.size()); ok=true;
+    }while(0);
+    if(freeProv)CryptReleaseContext(hProv,0);
+    CertFreeCertificateContext(cert); CertCloseStore(hStore,0);
+    return ok;
+}
+// Расшифровка CMS EnvelopedData (DECRYPT_SYNC) → base64 открытого текста.
+// Получателя CryptDecryptMessage находит сам среди сертификатов «My» с закрытым ключом,
+// поэтому CertThumb не нужен (сайт шлёт отпечаток самого свежего подходящего сертификата).
+static bool decryptCms(const std::string& body, std::string& outB64, std::string& err, std::string& info){
+    Bytes enc=b64dec(body);
+    if(!enc.empty() && enc[0]!=0x30){   // не DER — вдруг base64 внутри base64
+        Bytes inner=b64dec(std::string(enc.begin(),enc.end()));
+        if(!inner.empty() && inner[0]==0x30) enc=inner;
+    }
+    char ib[48]; snprintf(ib,sizeof(ib),"encLen=%zu",enc.size()); info=ib;
+    if(enc.empty() || enc[0]!=0x30){ err="Пустые или не CMS данные"; return false; }
+    HCERTSTORE hStore=CertOpenSystemStore(0,_TEXT("My")); if(!hStore){err="store";return false;}
+    CRYPT_DECRYPT_MESSAGE_PARA dp; memset(&dp,0,sizeof(dp));
+    dp.cbSize=sizeof(dp); dp.dwMsgAndCertEncodingType=TYPE_DER; dp.cCertStore=1; dp.rghCertStore=&hStore;
+    // открытый текст CMS не длиннее шифртекста — хватает одного вызова (без второго обращения к ключу)
+    Bytes out(enc.size()); DWORD n=(DWORD)out.size();
+    BOOL ok=CryptDecryptMessage(&dp,&enc[0],(DWORD)enc.size(),&out[0],&n,NULL);
+    if(!ok && lastErr()==ERROR_MORE_DATA){ out.resize(n); ok=CryptDecryptMessage(&dp,&enc[0],(DWORD)enc.size(),&out[0],&n,NULL); }
+    if(ok){ out.resize(n); outB64=n? b64enc(&out[0],n) : ""; }
+    else { char eb[48]; snprintf(eb,sizeof(eb),"decrypt failed 0x%08X",lastErr()); err=eb; }
+    CertCloseStore(hStore,0);
+    return ok;
+}
+
 //======================= HTTP =======================
 static void sendAll(int fd, const std::string& s){
     size_t off=0; while(off<s.size()){ ssize_t k=send(fd,s.data()+off,s.size()-off,0); if(k<=0)break; off+=k; }
@@ -236,10 +381,16 @@ static void handle(int fd){
     if(cl>MAX_REQ || bodyStart+cl>MAX_REQ){ close(fd); return; }
     while(req.size()-bodyStart < cl){ k=recv(fd,buf,sizeof(buf),0); if(k<=0)break; req.append(buf,k); }
     std::string body=req.substr(bodyStart, cl);
+    std::string origin;   // safari-web-extension://<UUID> или https://www.moedelo.org — кто спросил
+    size_t op=req.find("\r\nOrigin:");
+    if(op!=std::string::npos && op<hdrEnd){
+        op+=9; while(op<hdrEnd && req[op]==' ') op++;
+        origin=req.substr(op, req.find("\r\n",op)-op);
+    }
 
     if(method=="OPTIONS"){ respond(fd, ""); close(fd); return; }
 
-    std::string data="null", err; bool status=true;
+    std::string data="null", err, info; bool status=true;
     if(path=="/TRUST/GetVer"){ data="\"2.7.0.4\""; }
     else if(path=="/TRUST/TRYUSEPLUGIN_SYNC"){ data="null"; }
     else if(path=="/TRUST/ENUMCERTS_SYNC"){ data=enumCertsJson(); }
@@ -257,12 +408,23 @@ static void handle(int fd){
         else if(signDetached(qparam(query,"CertThumb"),doc,sig,err)) data="\""+sig+"\"";
         else { status=false; data="null"; }
     }
+    else if(path=="/TRUST/SIGN_HASH_SYNC"){   // «Моё Дело» с 2026-10 подписывает отчёты по хэшу
+        std::string sig;
+        if(signHash(qparam(query,"CertThumb"),body,sig,err,info)) data="\""+sig+"\"";
+        else { status=false; data="null"; }
+    }
+    else if(path=="/TRUST/DECRYPT_SYNC"){      // входящие (требования и т.п.) — CMS EnvelopedData
+        std::string plain;
+        if(decryptCms(body,plain,err,info)) data="\""+plain+"\"";
+        else { status=false; data="null"; }
+    }
     else { status=false; err="Unknown command"; data="null"; }
 
     time_t now=time(NULL); struct tm lt; localtime_r(&now,&lt); char ts[16]; strftime(ts,16,"%H:%M:%S",&lt);
-    fprintf(stderr,"%s  %-5s %-22s -> Status=%s dataLen=%zu%s%s\n",
+    fprintf(stderr,"%s  %-5s %-22s -> Status=%s dataLen=%zu%s%s%s%s  [%s]\n",
         ts, method.c_str(), path.c_str(), status?"true":"false", data.size(),
-        err.empty()?"":"  ERR=", err.c_str());
+        info.empty()?"":"  ", info.c_str(), err.empty()?"":"  ERR=", err.c_str(),
+        origin.empty()?"-":origin.c_str());
     fflush(stderr);
     respond(fd, envelope(data,status,err));
     close(fd);

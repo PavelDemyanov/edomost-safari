@@ -185,8 +185,7 @@ final class AppModel: ObservableObject {
     /// (автозапуск поднимает демон ~2 с), держим состояние «Проверка…» и пробуем снова,
     /// чтобы пользователь не увидел ложное «не запущена».
     func refresh(retries: Int = 0) {
-        SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: extensionBundleIdentifier) { state, _ in
-            let ext = state?.isEnabled ?? false
+        checkExtensionStable(attempts: 3) { extOrNil in
             self.checkPlugin { plugin in
                 let svc = PluginService.state
                 let old = PluginService.oldPluginInstalled
@@ -197,12 +196,32 @@ final class AppModel: ObservableObject {
                     return
                 }
                 DispatchQueue.main.async {
-                    self.extEnabled = ext
+                    // nil — состояние расширения узнать не удалось: НЕ трогаем статус,
+                    // чтобы не мигать ложным «выключено». Меняем только по достоверному ответу.
+                    if let ext = extOrNil { self.extEnabled = ext }
                     self.pluginOk = plugin
                     self.service = svc
                     self.oldPlugin = old
                     self.loaded = true
                 }
+            }
+        }
+    }
+
+    /// Состояние расширения из SFSafariExtensionManager нестабильно: API периодически
+    /// отдаёт ложное «выключено» или ошибку — отсюда мигание статуса. Поэтому «включено»
+    /// принимаем сразу, а «выключено»/ошибку перепроверяем несколько раз. Возвращаем
+    /// достоверный bool, либо nil если так и не удалось узнать (тогда статус не меняем).
+    private func checkExtensionStable(attempts: Int, _ completion: @escaping (Bool?) -> Void) {
+        SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: extensionBundleIdentifier) { state, _ in
+            if state?.isEnabled == true {
+                completion(true)
+            } else if attempts > 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    self.checkExtensionStable(attempts: attempts - 1, completion)
+                }
+            } else {
+                completion(state?.isEnabled)   // false = подтверждённо выключено; nil = не смогли узнать
             }
         }
     }

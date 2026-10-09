@@ -133,15 +133,14 @@
           for (var k in r.headers) headerStr += k + ': ' + r.headers[k] + '\r\n';
         }
         xhr.__mdHeaders = headerStr;
-        if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange(new Event('readystatechange'));
+        // dispatchEvent сам вызывает и on*-свойства — прямой вызов давал обработчику два срабатывания
         dispatch(xhr, 'readystatechange');
-        if (typeof xhr.onload === 'function') xhr.onload(new Event('load'));
         dispatch(xhr, 'load');
         dispatch(xhr, 'loadend');
       }).catch(function () {
         define(xhr, 'readyState', 4);
         define(xhr, 'status', 0);
-        if (typeof xhr.onerror === 'function') xhr.onerror(new Event('error'));
+        dispatch(xhr, 'readystatechange');
         dispatch(xhr, 'error');
         dispatch(xhr, 'loadend');
       });

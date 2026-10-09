@@ -64,8 +64,36 @@ authenticated attributes добавить вручную (signingTime + signingC
 ### 7. `POST /TRUST/GETSIGN_ATT_SYNC?…` (в бинаре; не в этом захвате)
 То же, но **attached** (документ вложен в SignedData) — вероятно без `CMSG_DETACHED_FLAG`.
 
-### 8. `POST /TRUST/DECRYPT_SYNC?CertThumb=<THUMB>&TaskId=<hex>` (замечен в трафике)
-Расшифровка (CMS enveloped). Для подписи не нужен; реализовать при необходимости.
+### 8. `POST /TRUST/DECRYPT_SYNC?CertThumb=<THUMB>&TaskId=<hex>` (реализован 2026-10-09)
+- Тело: **base64(DER CMS EnvelopedData)** — входящие документы (требования ФНС и т.п.).
+- → `Data`: **base64(расшифрованного содержимого)**; сайт без разбора отдаёт его на свой сервер.
+- `trustd`: `CryptDecryptMessage` по хранилищу «My» — получателя (сертификат с закрытым ключом)
+  CryptoAPI находит сам, `CertThumb` не нужен. Проверено на ГОСТ 28147-89 и «Кузнечике».
+- **Без него не работает и подпись**: сессия «Отчётности» сначала расшифровывает входящие,
+  и при ошибке расшифровки до операций подписи дело не доходит.
+
+### 9. `POST /TRUST/SIGN_HASH_SYNC?CertThumb=<THUMB>&TaskId=<hex>` (реализован 2026-10-09)
+С октября 2026 «Отчётность» может прислать вместо документа **готовый хэш** (операция `HashSignature`).
+- Тело: **base64(хэш ГОСТ Р 34.11-2012** документа, 32 байта для ключей 2012-256). `trustd` на всякий
+  случай принимает и hex-строку, и base64 от hex-строки.
+- → `Data`: **base64(DER PKCS#7 SignedData)** — та же отсоединённая CAdES-BES подпись, что у `GETSIGN_SYNC`,
+  но `messageDigest` = переданный хэш (аналог `SignHash` у КриптоПро). Хэш документа, а не готовых
+  атрибутов: сайт пробует одни и те же данные с разными сертификатами, значит данные от сертификата
+  не зависят.
+- В CryptoAPI нельзя подсунуть CryptMsg готовый хэш (он хэширует контент сам), а `libcades` в
+  КриптоПро на Mac нет, поэтому SignedData собирается вручную (`signHash` в `trustd.cpp`): атрибуты
+  contentType, signingTime, messageDigest, signingCertificateV2 → `CryptSignHash` над их DER-SET →
+  подпись **в обратном порядке байт** (CryptoAPI отдаёт little-endian). Проверено: на том же документе
+  ASN.1-структура байт-в-байт совпадает с CryptMsg-подписью из `GETSIGN_SYNC` (кроме времени и значения
+  подписи), `CMSG_CTRL_VERIFY_SIGNATURE` на исходном документе проходит.
+
+### Как сайт вызывает плагин (crypto center, 2026-10)
+Клиент плагина — модуль в `st.mdstatic.org/ecenter/md.*.js` (ищи `"http://localhost:18080"`): все вызовы —
+обычный `fetch` на `localhost:18080`. Операции раздаёт сервер (`/eds/crypto/center/api/v1/sessions/state`):
+`{Id, Kind, CertificateSerialNumbers, Data}`, где Kind = AttachedSignature (1) / DetachedSignature (2) /
+HashSignature (3) / CmsDecryption (4) / XmlForFssDecryption (5, `DECRYPT_FSS_RESPONSE_SYNC`). `Data` уходит
+плагину телом запроса, `Data` из ответа — серверу (`/operations`) как есть. Ещё есть `EnumAllCerts`,
+`GETRESULT_SYNC` — пока не встречались.
 
 ## План замены (arm64-демон в составе «ЭДО Мост»)
 1. HTTP-сервер на Swift (Network.framework / NIO) на 127.0.0.1:18080, те же пути + CORS.

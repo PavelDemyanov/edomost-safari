@@ -21,6 +21,16 @@
     var d = event.data;
     if (!d || d.__mdbridge !== 'request') return;
 
+    // Один запрос — один вызов плагина. Сообщение может прийти дважды (эхо postMessage
+    // скриптами страницы или второй экземпляр content-скрипта у дубля расширения) —
+    // тогда плагин подписывал/расшифровывал всё по два раза. Метка на <html> общая для
+    // всех изолированных миров кадра, поэтому «застолбить» запрос успевает только первый.
+    var root = document.documentElement;
+    var claim = 'data-mdbridge-' + String(d.id).replace(/[^\w-]/g, '');
+    if (root.hasAttribute(claim)) return;
+    root.setAttribute(claim, '');
+    setTimeout(function () { root.removeAttribute(claim); }, 600000);
+
     Promise.resolve(api.runtime.sendMessage({ type: 'mdbridge-request', req: d.req }))
       .then(function (result) {
         window.postMessage({ __mdbridge: 'response', id: d.id, result: result }, '*');
