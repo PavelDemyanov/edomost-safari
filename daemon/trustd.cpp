@@ -14,6 +14,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include "reader/tchar.h"
 #include "cpcsp/WinCryptEx.h"
 
@@ -333,6 +337,10 @@ static bool decryptCms(const std::string& body, std::string& outB64, std::string
 }
 
 //======================= HTTP =======================
+static bool g_restartAfter=false;   // handle() просит main перезапустить демон после ответа
+static std::string nowHMS(){
+    time_t now=time(NULL); struct tm lt; localtime_r(&now,&lt); char ts[16]; strftime(ts,16,"%H:%M:%S",&lt); return ts;
+}
 static void sendAll(int fd, const std::string& s){
     size_t off=0; while(off<s.size()){ ssize_t k=send(fd,s.data()+off,s.size()-off,0); if(k<=0)break; off+=k; }
 }
@@ -419,10 +427,12 @@ static void handle(int fd){
         else { status=false; data="null"; }
     }
     else { status=false; err="Unknown command"; data="null"; }
+    // ключ не открылся — возможно, протухло состояние носителя в процессе (см. reexec); следующую
+    // попытку пусть обслужит свежий процесс, чтобы не пришлось переподключать токен
+    if(err=="acquire private key" || err.compare(0,14,"decrypt failed")==0) g_restartAfter=true;
 
-    time_t now=time(NULL); struct tm lt; localtime_r(&now,&lt); char ts[16]; strftime(ts,16,"%H:%M:%S",&lt);
     fprintf(stderr,"%s  %-5s %-22s -> Status=%s dataLen=%zu%s%s%s%s  [%s]\n",
-        ts, method.c_str(), path.c_str(), status?"true":"false", data.size(),
+        nowHMS().c_str(), method.c_str(), path.c_str(), status?"true":"false", data.size(),
         info.empty()?"":"  ", info.c_str(), err.empty()?"":"  ERR=", err.c_str(),
         origin.empty()?"-":origin.c_str());
     fflush(stderr);
@@ -430,15 +440,55 @@ static void handle(int fd){
     close(fd);
 }
 
+//======================= перезапуск после сна =======================
+// Во сне Mac (особенно от батареи) USB обесточивается и Рутокен после пробуждения подключается
+// заново. Свежий процесс его видит, а долгоживущий trustd — нет: PKCS#11-слой КриптоПро внутри
+// процесса держит старое подключение, и подпись падает диалогом «Insert carrier pkcs11_rutoken_ecp_…»
+// (лечилось только переподключением токена). Поэтому после сна демон заменяет себя свежей копией
+// через exec — тот же PID для launchd, слушающий сокет и текущее соединение передаются новой копии.
+#ifndef SLEEP_RESTART_SEC
+#define SLEEP_RESTART_SEC 30          // сколько суммарно проспать, чтобы перезапуститься (сек)
+#endif
+// CLOCK_UPTIME_RAW во сне стоит, CLOCK_REALTIME идёт: их разница растёт ровно на время сна
+static double sleepOffset(){
+    struct timespec w,u; clock_gettime(CLOCK_REALTIME,&w); clock_gettime(CLOCK_UPTIME_RAW,&u);
+    return (double)(w.tv_sec-u.tv_sec) + (w.tv_nsec-u.tv_nsec)/1e9;
+}
+static void reexec(int port, int listenFd, int clientFd, const char* why){
+    char path[PATH_MAX]; uint32_t n=sizeof(path);
+    if(_NSGetExecutablePath(path,&n)!=0) return;
+    char sp[16], lf[16], cf[16];
+    snprintf(sp,sizeof(sp),"%d",port); snprintf(lf,sizeof(lf),"%d",listenFd); snprintf(cf,sizeof(cf),"%d",clientFd);
+    fprintf(stderr,"%s  перезапуск: %s\n",nowHMS().c_str(),why); fflush(stderr);
+    // в новую копию — только stdio (stderr = лог) и наши два сокета; дескрипторы КриптоПро
+    // (PC/SC и пр.) закрываются, иначе старое подключение к носителю потянулось бы за нами
+    for(int fd=3, mx=getdtablesize(); fd<mx; fd++)
+        if(fd!=listenFd && fd!=clientFd) fcntl(fd,F_SETFD,FD_CLOEXEC);
+    char* args[]={path,sp,(char*)"--inherit",lf,cf,NULL};
+    execv(path,args);
+    fprintf(stderr,"%s  перезапуск не удался (errno %d), работаю дальше\n",nowHMS().c_str(),errno); fflush(stderr);
+}
+
 int main(int argc, char** argv){
     int port = argc>1 ? atoi(argv[1]) : 18080;
-    int s=socket(AF_INET,SOCK_STREAM,0);
-    int one=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
-    sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family=AF_INET; a.sin_port=htons(port);
-    a.sin_addr.s_addr=inet_addr("127.0.0.1");
-    if(bind(s,(sockaddr*)&a,sizeof(a))<0){ perror("bind"); return 1; }
-    if(listen(s,16)<0){ perror("listen"); return 1; }
-    fprintf(stderr,"trustd слушает 127.0.0.1:%d\n",port);
-    for(;;){ int c=accept(s,NULL,NULL); if(c<0)continue; handle(c); }
+    int s=-1, first=-1;
+    if(argc>4 && !strcmp(argv[2],"--inherit")){ s=atoi(argv[3]); first=atoi(argv[4]); }   // после reexec
+    else {
+        s=socket(AF_INET,SOCK_STREAM,0);
+        int one=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
+        sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family=AF_INET; a.sin_port=htons(port);
+        a.sin_addr.s_addr=inet_addr("127.0.0.1");
+        if(bind(s,(sockaddr*)&a,sizeof(a))<0){ perror("bind"); return 1; }
+        if(listen(s,16)<0){ perror("listen"); return 1; }
+        fprintf(stderr,"trustd слушает 127.0.0.1:%d\n",port);
+    }
+    const double base=sleepOffset();
+    if(first>=0) handle(first);   // запрос, на котором предыдущая копия решила перезапуститься
+    for(;;){
+        int c=accept(s,NULL,NULL); if(c<0)continue;
+        if(sleepOffset()-base > SLEEP_RESTART_SEC) reexec(port,s,c,"Mac просыпался — переоткрываю носители");
+        handle(c);
+        if(g_restartAfter){ g_restartAfter=false; reexec(port,s,-1,"ключ не открылся — сбрасываю состояние КриптоПро"); }
+    }
     return 0;
 }
